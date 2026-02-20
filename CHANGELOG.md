@@ -6,24 +6,19 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
-- `gemini-hook` CLI command to consume Gemini hook payloads from `stdin` and notify on task-level events (defaults to `AfterAgent`).
-- `claude-hook` CLI command to consume Claude hook payloads from `stdin` and notify on task-level events (defaults to `Stop`).
-- `codex-hook` CLI command to consume Codex `notify` payloads from argument or `stdin` and notify on `agent-turn-complete`.
-- `ollama-hook` CLI command to consume Ollama JSON/JSONL output and notify when `done=true`.
-- README guidance and configuration example for task-level Gemini notifications via `~/.gemini/settings.json` hooks.
-- README guidance and configuration examples for Codex `notify` and Claude hook setup.
-- `gemini-hook --quiet-when-focused` option to suppress notifications while terminal is frontmost on macOS.
-- `gemini-hook --chime` option (`none|bell|ping`) for optional sound alerts.
-- Portable `examples/codex_notify_bridge.sh` that no longer depends on machine-specific paths.
-- `docs/release_checklist.md` with Git/GitHub/tag/release steps.
-- GitHub `Release Build` workflow (`.github/workflows/release.yml`) for tag-triggered lint/test/build checks.
-- GitHub issue templates and pull request template for contributor-friendly triage/reviews.
+- (none yet)
 
 ### Changed
 
-- Removed hardcoded absolute paths from README Codex setup examples.
-- Expanded `.gitignore` with build artifacts, coverage files, logs, and temp debug outputs.
+- (none yet)
+
+## [0.1.1] - 2026-02-20
+
+### Changed
+
 - Reworked README onboarding flow with clearer mode selection, per-tool setup recipes, and troubleshooting guidance.
+- Clarified task-level vs shell-exit notification behavior to reduce setup confusion.
+- Added `.release-venv/` to `.gitignore` to keep local release environments out of commits.
 
 ## [0.1.0] - 2026-02-20
 

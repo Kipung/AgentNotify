@@ -60,11 +60,11 @@ git push origin main
 ## 5. Tag + Release
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git tag vX.Y.Z
+git push origin vX.Y.Z
 ```
 
-Create a GitHub release from `v0.1.0` and paste notes from `CHANGELOG.md`.
+Create a GitHub release from `vX.Y.Z` and paste notes from `CHANGELOG.md`.
 
 ## 6. Post-Release Smoke Test
 
