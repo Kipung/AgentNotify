@@ -1,0 +1,1213 @@
+"""Click command-line interface for agent-notify."""
+
+from __future__ import annotations
+
+import json
+import os
+import platform
+import shlex
+import shutil
+import subprocess
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+import click
+
+from agentnotify.config.config import AppConfig, load_config
+from agentnotify.core.notifications import build_title, notify_run_completion, notify_watch_completion
+from agentnotify.core.procinfo import get_process_name
+from agentnotify.core.result import RunResult, WatchResult
+from agentnotify.core.runner import ProcessRunner
+from agentnotify.core.shellhooks import render_shell_init
+from agentnotify.core.watcher import ProcessWatcher
+from agentnotify.notify.base import CompositeNotifier, NotificationLevel, Notifier, NotifierUnavailable
+from agentnotify.notify.console import ConsoleNotifier
+from agentnotify.notify.macos import MacOSNotifier
+from agentnotify.notify.windows import WindowsNotifier
+
+CHANNEL_CHOICES = ["desktop", "console", "both"]
+CHIME_CHOICES = ["none", "bell", "ping"]
+SHELL_CHOICES = ["zsh", "bash"]
+TERMINAL_APP_NAMES = {
+    "Terminal",
+    "iTerm2",
+    "Warp",
+    "WezTerm",
+    "Alacritty",
+    "kitty",
+    "Ghostty",
+    "Hyper",
+    "Tabby",
+}
+
+
+@click.group(help="Notify when long-running agentic commands complete.")
+def app() -> None:
+    """Root CLI group."""
+
+
+def _warn(message: str) -> None:
+    click.secho(message, fg="yellow", err=True)
+
+
+def _clip_for_notification(value: object, limit: int) -> str:
+    if value is None:
+        return ""
+
+    compact = " ".join(str(value).split())
+    if len(compact) <= limit:
+        return compact
+    if limit <= 3:
+        return compact[:limit]
+    return f"{compact[: limit - 3]}..."
+
+
+def _read_json_payload(
+    *,
+    payload_text: str,
+    verbose: bool,
+    source_label: str,
+) -> dict[str, object] | None:
+    if not payload_text.strip():
+        if verbose:
+            _warn(f"{source_label} payload missing. Skipping notification.")
+        return None
+
+    try:
+        payload = json.loads(payload_text)
+    except json.JSONDecodeError:
+        if verbose:
+            _warn(f"{source_label} payload is not valid JSON. Skipping notification.")
+        return None
+
+    if not isinstance(payload, dict):
+        if verbose:
+            _warn(f"{source_label} payload must be a JSON object. Skipping notification.")
+        return None
+    return payload
+
+
+def _try_parse_json_object(payload_text: str) -> dict[str, object] | None:
+    text = payload_text.strip()
+    if not text:
+        return None
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return payload
+
+
+def _read_json_lines_payload(
+    *,
+    payload_text: str,
+    verbose: bool,
+    source_label: str,
+) -> dict[str, object] | None:
+    if not payload_text.strip():
+        if verbose:
+            _warn(f"{source_label} payload missing. Skipping notification.")
+        return None
+
+    parsed: dict[str, object] | None = None
+    for line in payload_text.splitlines():
+        text = line.strip()
+        if not text:
+            continue
+        try:
+            candidate = json.loads(text)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(candidate, dict):
+            parsed = candidate
+
+    if parsed is None:
+        if verbose:
+            _warn(f"{source_label} payload did not include JSON object lines. Skipping notification.")
+        return None
+    return parsed
+
+
+def _extract_payload_text(payload: dict[str, object], keys: tuple[str, ...], limit: int) -> str:
+    for key in keys:
+        if key not in payload:
+            continue
+        clipped = _clip_for_notification(payload.get(key), limit)
+        if clipped:
+            return clipped
+    return ""
+
+
+def _extract_payload_event(payload: dict[str, object]) -> str:
+    return _extract_payload_text(payload, ("hook_event_name", "event", "type"), 80)
+
+
+def _normalize_event_name(name: str) -> str:
+    return name.strip().lower().replace("_", "-")
+
+
+def _extract_codex_event(payload: dict[str, object]) -> str:
+    explicit_event = _extract_payload_event(payload)
+    if explicit_event:
+        return explicit_event
+
+    # Codex legacy notify payload may omit an explicit event field.
+    legacy_keys = ("thread-id", "turn-id", "input-messages", "last-assistant-message")
+    if any(key in payload for key in legacy_keys):
+        return "after_agent"
+    return ""
+
+
+def _parse_codex_payload_parts(parts: tuple[str, ...]) -> dict[str, object] | None:
+    if not parts:
+        return None
+
+    joined = " ".join(parts).strip()
+    parsed = _try_parse_json_object(joined)
+    if parsed is not None:
+        return parsed
+
+    result: dict[str, object] = {}
+    loose_parts: list[str] = []
+    for part in parts:
+        if "=" in part:
+            key, value = part.split("=", 1)
+            key = key.strip()
+            if key:
+                result[key] = value.strip()
+            continue
+        loose_parts.append(part)
+
+    if loose_parts and len(loose_parts) % 2 == 0:
+        for index in range(0, len(loose_parts), 2):
+            key = loose_parts[index].strip()
+            if key:
+                result[key] = loose_parts[index + 1]
+    elif loose_parts and not result:
+        # Last-resort fallback for unknown positional payloads.
+        result["raw_payload"] = joined
+
+    return result or None
+
+
+def _is_user_focused_on_terminal(*, verbose: bool) -> bool:
+    if platform.system() != "Darwin":
+        return False
+    if shutil.which("osascript") is None:
+        return False
+
+    script = (
+        'tell application "System Events" '
+        "to get name of first application process whose frontmost is true"
+    )
+    try:
+        completed = subprocess.run(
+            ["osascript", "-e", script],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except Exception as exc:
+        if verbose:
+            _warn(f"Unable to detect frontmost app: {exc}")
+        return False
+
+    if completed.returncode != 0:
+        if verbose:
+            stderr = completed.stderr.strip() or "unknown osascript error"
+            _warn(f"Unable to detect frontmost app: {stderr}")
+        return False
+
+    frontmost = completed.stdout.strip()
+    return frontmost in TERMINAL_APP_NAMES
+
+
+def _play_chime(chime: str, *, verbose: bool) -> None:
+    selected = chime.lower()
+    if selected == "none":
+        return
+
+    if selected == "bell":
+        try:
+            sys.stderr.write("\a")
+            sys.stderr.flush()
+        except Exception as exc:
+            if verbose:
+                _warn(f"Bell chime failed: {exc}")
+        return
+
+    if selected != "ping":
+        return
+
+    system = platform.system()
+    if system == "Darwin":
+        afplay = shutil.which("afplay")
+        if not afplay:
+            if verbose:
+                _warn("afplay not found; falling back to terminal bell.")
+            _play_chime("bell", verbose=verbose)
+            return
+
+        # Prefer system Ping sound; fallback to bell if unavailable.
+        sound_candidates = [
+            "/System/Library/Sounds/Ping.aiff",
+            "/System/Library/Sounds/Glass.aiff",
+        ]
+        for sound_path in sound_candidates:
+            if not Path(sound_path).exists():
+                continue
+            completed = subprocess.run(
+                [afplay, sound_path],
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            if completed.returncode == 0:
+                return
+
+        if verbose:
+            _warn("Unable to play macOS ping sound; falling back to terminal bell.")
+        _play_chime("bell", verbose=verbose)
+        return
+
+    if system == "Windows":
+        completed = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-Command",
+                "[console]::beep(1000,220)",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if completed.returncode != 0 and verbose:
+            _warn("Windows ping chime failed; falling back to terminal bell.")
+        if completed.returncode != 0:
+            _play_chime("bell", verbose=verbose)
+        return
+
+    # For Linux/other platforms, use terminal bell as a minimal fallback.
+    _play_chime("bell", verbose=verbose)
+
+
+def _build_desktop_notifier() -> Notifier:
+    system = platform.system()
+    if system == "Darwin":
+        return MacOSNotifier()
+    if system == "Windows":
+        return WindowsNotifier()
+    raise NotifierUnavailable(f"Desktop notifications are not implemented for {system}")
+
+
+def _resolve_notifier(channel: str, verbose: bool) -> Notifier:
+    if channel == "console":
+        return ConsoleNotifier()
+
+    if channel == "both":
+        notifiers: list[Notifier] = [ConsoleNotifier()]
+        try:
+            notifiers.insert(0, _build_desktop_notifier())
+        except NotifierUnavailable as exc:
+            if verbose:
+                _warn(f"Desktop notifier unavailable: {exc}. Falling back to console only.")
+        return CompositeNotifier(notifiers)
+
+    try:
+        return _build_desktop_notifier()
+    except NotifierUnavailable as exc:
+        _warn(f"Desktop notifier unavailable: {exc}. Falling back to console output.")
+        return ConsoleNotifier()
+
+
+def _default_channel(config: AppConfig) -> str:
+    channels = [entry.lower() for entry in config.channels or []]
+    if "console" in channels and "desktop" in channels:
+        return "both"
+    if "console" in channels:
+        return "console"
+    return "desktop"
+
+
+def _infer_tool_name_from_command(command: tuple[str, ...]) -> str | None:
+    if not command:
+        return None
+
+    executable = Path(command[0]).name.strip()
+    if not executable:
+        return None
+
+    lowered = executable.lower()
+    if lowered.endswith(".exe"):
+        executable = executable[:-4]
+        lowered = executable.lower()
+
+    # Prefer module name for "python -m <module>" invocations.
+    if lowered.startswith("python") and "-m" in command:
+        module_index = command.index("-m") + 1
+        if module_index < len(command):
+            module_name = command[module_index].strip()
+            if module_name:
+                return module_name
+
+    return executable
+
+
+def _infer_tool_name_from_pid(pid: int) -> str | None:
+    process_name = get_process_name(pid)
+    if process_name:
+        return process_name
+    if pid > 0:
+        return f"pid-{pid}"
+    return None
+
+
+def _detect_shell() -> str:
+    shell_path = os.environ.get("SHELL", "")
+    shell_name = Path(shell_path).name.lower()
+    if "bash" in shell_name:
+        return "bash"
+    return "zsh"
+
+
+def _resolve_notifier_bin() -> str:
+    # Prefer the CLI binary currently used in this shell.
+    detected = shutil.which("agent-notify")
+    if detected:
+        return str(Path(detected).resolve())
+
+    executable = Path(sys.executable)
+    candidate = executable.parent / "agent-notify"
+    if candidate.exists():
+        return str(candidate)
+
+    resolved_candidate = executable.resolve().parent / "agent-notify"
+    if resolved_candidate.exists():
+        return str(resolved_candidate)
+
+    argv0 = Path(sys.argv[0])
+    if argv0.exists() and argv0.name.startswith("agent-notify"):
+        return str(argv0.resolve())
+
+    # Fallback used by shell script only when AGENT_NOTIFY_BIN is missing.
+    return "agent-notify"
+
+
+def _notify_run_with_fallback(
+    *,
+    notifier: Notifier,
+    result: RunResult,
+    tool_name: str | None,
+    title_override: str | None,
+    default_tool_name: str,
+    verbose: bool,
+) -> None:
+    try:
+        notify_run_completion(
+            notifier,
+            result,
+            tool_name=tool_name,
+            title_override=title_override,
+            default_tool_name=default_tool_name,
+        )
+    except Exception as exc:
+        _warn(f"Desktop notification failed: {exc}. Falling back to console output.")
+        if verbose:
+            _warn("Use --channel console to avoid desktop notifier errors in headless sessions.")
+        notify_run_completion(
+            ConsoleNotifier(),
+            result,
+            tool_name=tool_name,
+            title_override=title_override,
+            default_tool_name=default_tool_name,
+        )
+
+
+def _notify_watch_with_fallback(
+    *,
+    notifier: Notifier,
+    result: WatchResult,
+    tool_name: str | None,
+    title_override: str | None,
+    default_tool_name: str,
+    verbose: bool,
+) -> None:
+    try:
+        notify_watch_completion(
+            notifier,
+            result,
+            tool_name=tool_name,
+            title_override=title_override,
+            default_tool_name=default_tool_name,
+        )
+    except Exception as exc:
+        _warn(f"Desktop notification failed: {exc}. Falling back to console output.")
+        if verbose:
+            _warn("Use --channel console to avoid desktop notifier errors in headless sessions.")
+        notify_watch_completion(
+            ConsoleNotifier(),
+            result,
+            tool_name=tool_name,
+            title_override=title_override,
+            default_tool_name=default_tool_name,
+        )
+
+
+@app.command(
+    "run",
+    context_settings={"ignore_unknown_options": True},
+    help="Run a command, wait for completion, and send notification.",
+)
+@click.option("--name", type=str, default=None, help="Tool name shown in notification title.")
+@click.option("--title", type=str, default=None, help="Override notification title.")
+@click.option(
+    "--tail-lines",
+    type=click.IntRange(min=1),
+    default=None,
+    help="Include last N lines of combined stdout/stderr in notification body.",
+)
+@click.option("--no-capture", is_flag=True, help="Disable output capture.")
+@click.option(
+    "--channel",
+    type=click.Choice(CHANNEL_CHOICES, case_sensitive=False),
+    default=None,
+    help="Notification channel: desktop, console, or both.",
+)
+@click.option("--verbose", is_flag=True, help="Enable verbose logs.")
+@click.argument("command", nargs=-1, type=click.UNPROCESSED, required=True)
+def run_command(
+    name: str | None,
+    title: str | None,
+    tail_lines: int | None,
+    no_capture: bool,
+    channel: str | None,
+    verbose: bool,
+    command: tuple[str, ...],
+) -> None:
+    if not command:
+        raise click.UsageError("Missing command. Usage: agent-notify run -- <cmd...>")
+
+    config = load_config()
+    selected_channel = channel or _default_channel(config)
+    notifier = _resolve_notifier(selected_channel, verbose=verbose)
+    effective_name = name or _infer_tool_name_from_command(command)
+
+    runner = ProcessRunner()
+    effective_tail = tail_lines if tail_lines is not None else config.tail_lines
+
+    try:
+        result = runner.run(
+            list(command),
+            tool_name=effective_name,
+            capture_output=not no_capture,
+            tail_lines=effective_tail,
+        )
+    except FileNotFoundError as exc:
+        click.secho(f"Command not found: {exc.filename}", fg="red", err=True)
+        raise SystemExit(127)
+    except Exception as exc:
+        click.secho(f"Failed to run command: {exc}", fg="red", err=True)
+        raise SystemExit(1)
+
+    _notify_run_with_fallback(
+        notifier=notifier,
+        result=result,
+        tool_name=effective_name,
+        title_override=title,
+        default_tool_name=config.title_prefix,
+        verbose=verbose,
+    )
+
+    raise SystemExit(result.exit_code)
+
+
+@app.command("emit", help="Send a completion notification from external integrations.")
+@click.option("--name", type=str, default=None, help="Tool name shown in notification title.")
+@click.option("--title", type=str, default=None, help="Override notification title.")
+@click.option("--command", "command_text", type=str, required=True, help="Command string to include.")
+@click.option(
+    "--duration-seconds",
+    type=click.FloatRange(min=0.0),
+    required=True,
+    help="Elapsed duration in seconds.",
+)
+@click.option("--exit-code", type=int, required=True, help="Command exit code.")
+@click.option(
+    "--channel",
+    type=click.Choice(CHANNEL_CHOICES, case_sensitive=False),
+    default=None,
+    help="Notification channel: desktop, console, or both.",
+)
+@click.option("--verbose", is_flag=True, help="Enable verbose logs.")
+def emit_command(
+    name: str | None,
+    title: str | None,
+    command_text: str,
+    duration_seconds: float,
+    exit_code: int,
+    channel: str | None,
+    verbose: bool,
+) -> None:
+    config = load_config()
+    selected_channel = channel or _default_channel(config)
+    notifier = _resolve_notifier(selected_channel, verbose=verbose)
+
+    parsed_command = shlex.split(command_text) if command_text else []
+    effective_name = name or _infer_tool_name_from_command(tuple(parsed_command))
+
+    now = datetime.now(timezone.utc)
+    result = RunResult(
+        command=parsed_command or [command_text],
+        exit_code=exit_code,
+        duration_seconds=duration_seconds,
+        output_tail=[],
+        started_at=now,
+        ended_at=now,
+        tool_name=effective_name,
+    )
+
+    _notify_run_with_fallback(
+        notifier=notifier,
+        result=result,
+        tool_name=effective_name,
+        title_override=title,
+        default_tool_name=config.title_prefix,
+        verbose=verbose,
+    )
+
+
+def _notify_task_hook(
+    *,
+    name: str,
+    title: str | None,
+    channel: str | None,
+    quiet_when_focused: bool,
+    chime: str,
+    verbose: bool,
+    body_lines: list[str],
+    metadata: dict[str, object],
+) -> None:
+    if quiet_when_focused and _is_user_focused_on_terminal(verbose=verbose):
+        return
+
+    config = load_config()
+    selected_channel = channel or _default_channel(config)
+    notifier = _resolve_notifier(selected_channel, verbose=verbose)
+
+    rendered_lines = [line for line in body_lines if line.strip()]
+    if not rendered_lines:
+        rendered_lines = ["Task event received."]
+
+    title_text = build_title(
+        exit_code=0,
+        tool_name=name,
+        title_override=title,
+        default_tool_name=config.title_prefix,
+    )
+    body_text = "\n".join(rendered_lines)
+
+    try:
+        notifier.notify(
+            title=title_text,
+            message=body_text,
+            level=NotificationLevel.SUCCESS,
+            metadata=metadata,
+        )
+    except Exception as exc:
+        _warn(f"Desktop notification failed: {exc}. Falling back to console output.")
+        if verbose:
+            _warn("Use --channel console to avoid desktop notifier errors in headless sessions.")
+        ConsoleNotifier().notify(
+            title=title_text,
+            message=body_text,
+            level=NotificationLevel.SUCCESS,
+            metadata=metadata,
+        )
+
+    _play_chime(chime, verbose=verbose)
+
+
+def _payload_event_matches(hook_event: str, target_event: str) -> bool:
+    actual = _normalize_event_name(hook_event)
+    target = _normalize_event_name(target_event)
+    if actual == target:
+        return True
+
+    # Backward/forward compatibility between Codex legacy and current names.
+    aliases: dict[str, set[str]] = {
+        "after-agent": {"after-agent", "agent-turn-complete"},
+        "agent-turn-complete": {"after-agent", "agent-turn-complete"},
+    }
+    return target in aliases.get(actual, {actual})
+
+
+@app.command("gemini-hook", help="Send notification from Gemini CLI hook events (task-level).")
+@click.option(
+    "--event",
+    "target_event",
+    type=str,
+    default="AfterAgent",
+    show_default=True,
+    help="Gemini hook event name that should trigger a notification.",
+)
+@click.option("--name", type=str, default="gemini", show_default=True, help="Tool name in title.")
+@click.option("--title", type=str, default=None, help="Override notification title.")
+@click.option(
+    "--channel",
+    type=click.Choice(CHANNEL_CHOICES, case_sensitive=False),
+    default=None,
+    help="Notification channel: desktop, console, or both.",
+)
+@click.option(
+    "--max-prompt-chars",
+    type=click.IntRange(min=20),
+    default=160,
+    show_default=True,
+    help="Maximum prompt length to include in the notification body.",
+)
+@click.option(
+    "--max-response-chars",
+    type=click.IntRange(min=20),
+    default=220,
+    show_default=True,
+    help="Maximum response length to include in the notification body.",
+)
+@click.option(
+    "--quiet-when-focused/--notify-when-focused",
+    default=False,
+    show_default=True,
+    help="Skip notifications when your terminal app is frontmost (macOS).",
+)
+@click.option(
+    "--chime",
+    type=click.Choice(CHIME_CHOICES, case_sensitive=False),
+    default="none",
+    show_default=True,
+    help="Optional sound: none, bell, or ping.",
+)
+@click.option("--verbose", is_flag=True, help="Enable verbose logs.")
+def gemini_hook_command(
+    target_event: str,
+    name: str,
+    title: str | None,
+    channel: str | None,
+    max_prompt_chars: int,
+    max_response_chars: int,
+    quiet_when_focused: bool,
+    chime: str,
+    verbose: bool,
+) -> None:
+    payload = _read_json_payload(payload_text=sys.stdin.read(), verbose=verbose, source_label="Gemini hook")
+    if payload is None:
+        return
+
+    hook_event = _extract_payload_event(payload)
+    if not _payload_event_matches(hook_event, target_event):
+        return
+
+    prompt = _extract_payload_text(payload, ("prompt",), max_prompt_chars)
+    response = _extract_payload_text(payload, ("prompt_response",), max_response_chars)
+    session_id = _extract_payload_text(payload, ("session_id",), 64)
+
+    body_lines: list[str] = [f"Event: {hook_event}"]
+    if prompt:
+        body_lines.append(f"Prompt: {prompt}")
+    if response:
+        body_lines.append(f"Response: {response}")
+    if session_id:
+        body_lines.append(f"Session: {session_id}")
+
+    _notify_task_hook(
+        name=name,
+        title=title,
+        channel=channel,
+        quiet_when_focused=quiet_when_focused,
+        chime=chime,
+        verbose=verbose,
+        body_lines=body_lines,
+        metadata={
+            "event": hook_event,
+            "session_id": payload.get("session_id"),
+            "has_prompt": bool(prompt),
+            "has_response": bool(response),
+            "source": "gemini",
+        },
+    )
+
+
+@app.command("claude-hook", help="Send notification from Claude Code hook events (task-level).")
+@click.option(
+    "--event",
+    "target_event",
+    type=str,
+    default="Stop",
+    show_default=True,
+    help="Claude hook event name that should trigger a notification.",
+)
+@click.option(
+    "--name",
+    type=str,
+    default="claude-code",
+    show_default=True,
+    help="Tool name in title.",
+)
+@click.option("--title", type=str, default=None, help="Override notification title.")
+@click.option(
+    "--channel",
+    type=click.Choice(CHANNEL_CHOICES, case_sensitive=False),
+    default=None,
+    help="Notification channel: desktop, console, or both.",
+)
+@click.option(
+    "--max-user-prompt-chars",
+    type=click.IntRange(min=20),
+    default=160,
+    show_default=True,
+    help="Maximum user prompt length to include in the notification body.",
+)
+@click.option(
+    "--max-result-chars",
+    type=click.IntRange(min=20),
+    default=220,
+    show_default=True,
+    help="Maximum tool/result text length to include in the notification body.",
+)
+@click.option(
+    "--quiet-when-focused/--notify-when-focused",
+    default=False,
+    show_default=True,
+    help="Skip notifications when your terminal app is frontmost (macOS).",
+)
+@click.option(
+    "--chime",
+    type=click.Choice(CHIME_CHOICES, case_sensitive=False),
+    default="none",
+    show_default=True,
+    help="Optional sound: none, bell, or ping.",
+)
+@click.option("--verbose", is_flag=True, help="Enable verbose logs.")
+def claude_hook_command(
+    target_event: str,
+    name: str,
+    title: str | None,
+    channel: str | None,
+    max_user_prompt_chars: int,
+    max_result_chars: int,
+    quiet_when_focused: bool,
+    chime: str,
+    verbose: bool,
+) -> None:
+    payload = _read_json_payload(payload_text=sys.stdin.read(), verbose=verbose, source_label="Claude hook")
+    if payload is None:
+        return
+
+    hook_event = _extract_payload_event(payload)
+    if not _payload_event_matches(hook_event, target_event):
+        return
+
+    user_prompt = _extract_payload_text(payload, ("user_prompt",), max_user_prompt_chars)
+    reason = _extract_payload_text(payload, ("reason",), 120)
+    tool_name = _extract_payload_text(payload, ("tool_name",), 80)
+    tool_result = _extract_payload_text(payload, ("tool_result",), max_result_chars)
+    session_id = _extract_payload_text(payload, ("session_id",), 64)
+
+    body_lines: list[str] = [f"Event: {hook_event}"]
+    if reason:
+        body_lines.append(f"Reason: {reason}")
+    if user_prompt:
+        body_lines.append(f"Prompt: {user_prompt}")
+    if tool_name:
+        body_lines.append(f"Tool: {tool_name}")
+    if tool_result:
+        body_lines.append(f"Result: {tool_result}")
+    if session_id:
+        body_lines.append(f"Session: {session_id}")
+
+    _notify_task_hook(
+        name=name,
+        title=title,
+        channel=channel,
+        quiet_when_focused=quiet_when_focused,
+        chime=chime,
+        verbose=verbose,
+        body_lines=body_lines,
+        metadata={
+            "event": hook_event,
+            "session_id": payload.get("session_id"),
+            "reason": payload.get("reason"),
+            "tool_name": payload.get("tool_name"),
+            "source": "claude",
+        },
+    )
+
+
+@app.command("codex-hook", help="Send notification from Codex notify hook payloads (task-level).")
+@click.option(
+    "--event",
+    "target_event",
+    type=str,
+    default="agent-turn-complete",
+    show_default=True,
+    help="Codex event type that should trigger a notification.",
+)
+@click.option("--name", type=str, default="codex", show_default=True, help="Tool name in title.")
+@click.option("--title", type=str, default=None, help="Override notification title.")
+@click.option(
+    "--channel",
+    type=click.Choice(CHANNEL_CHOICES, case_sensitive=False),
+    default=None,
+    help="Notification channel: desktop, console, or both.",
+)
+@click.option(
+    "--max-input-chars",
+    type=click.IntRange(min=20),
+    default=140,
+    show_default=True,
+    help="Maximum input preview length in the notification body.",
+)
+@click.option(
+    "--max-assistant-chars",
+    type=click.IntRange(min=20),
+    default=220,
+    show_default=True,
+    help="Maximum assistant message length in the notification body.",
+)
+@click.option(
+    "--quiet-when-focused/--notify-when-focused",
+    default=False,
+    show_default=True,
+    help="Skip notifications when your terminal app is frontmost (macOS).",
+)
+@click.option(
+    "--chime",
+    type=click.Choice(CHIME_CHOICES, case_sensitive=False),
+    default="none",
+    show_default=True,
+    help="Optional sound: none, bell, or ping.",
+)
+@click.option("--verbose", is_flag=True, help="Enable verbose logs.")
+@click.argument("payload_parts", nargs=-1)
+def codex_hook_command(
+    target_event: str,
+    name: str,
+    title: str | None,
+    channel: str | None,
+    max_input_chars: int,
+    max_assistant_chars: int,
+    quiet_when_focused: bool,
+    chime: str,
+    verbose: bool,
+    payload_parts: tuple[str, ...],
+) -> None:
+    payload_obj = _parse_codex_payload_parts(payload_parts)
+    if payload_obj is None:
+        payload_obj = _try_parse_json_object(sys.stdin.read())
+    if payload_obj is None:
+        if verbose:
+            _warn("Codex hook payload missing. Skipping notification.")
+        return
+
+    hook_event = _extract_codex_event(payload_obj)
+    if not hook_event:
+        if verbose:
+            _warn("Codex hook payload missing event details. Skipping notification.")
+        return
+    if not _payload_event_matches(hook_event, target_event):
+        return
+
+    input_preview = _extract_payload_text(payload_obj, ("input-messages", "input_messages"), max_input_chars)
+    assistant_preview = _extract_payload_text(
+        payload_obj,
+        ("last-assistant-message", "last_assistant_message"),
+        max_assistant_chars,
+    )
+    cwd = _extract_payload_text(payload_obj, ("cwd",), 120)
+    turn_id = _extract_payload_text(payload_obj, ("turn-id", "turn_id"), 64)
+
+    body_lines: list[str] = [f"Event: {hook_event}"]
+    if input_preview:
+        body_lines.append(f"Input: {input_preview}")
+    if assistant_preview:
+        body_lines.append(f"Assistant: {assistant_preview}")
+    if cwd:
+        body_lines.append(f"CWD: {cwd}")
+    if turn_id:
+        body_lines.append(f"Turn: {turn_id}")
+
+    _notify_task_hook(
+        name=name,
+        title=title,
+        channel=channel,
+        quiet_when_focused=quiet_when_focused,
+        chime=chime,
+        verbose=verbose,
+        body_lines=body_lines,
+        metadata={
+            "event": hook_event,
+            "turn_id": payload_obj.get("turn-id") or payload_obj.get("turn_id"),
+            "cwd": payload_obj.get("cwd"),
+            "source": "codex",
+        },
+    )
+
+
+@app.command(
+    "ollama-hook",
+    help="Send notification from Ollama JSON/JSONL output (use with --format json).",
+)
+@click.option("--name", type=str, default="ollama", show_default=True, help="Tool name in title.")
+@click.option("--title", type=str, default=None, help="Override notification title.")
+@click.option(
+    "--channel",
+    type=click.Choice(CHANNEL_CHOICES, case_sensitive=False),
+    default=None,
+    help="Notification channel: desktop, console, or both.",
+)
+@click.option(
+    "--max-response-chars",
+    type=click.IntRange(min=20),
+    default=220,
+    show_default=True,
+    help="Maximum response text length in the notification body.",
+)
+@click.option(
+    "--quiet-when-focused/--notify-when-focused",
+    default=False,
+    show_default=True,
+    help="Skip notifications when your terminal app is frontmost (macOS).",
+)
+@click.option(
+    "--chime",
+    type=click.Choice(CHIME_CHOICES, case_sensitive=False),
+    default="none",
+    show_default=True,
+    help="Optional sound: none, bell, or ping.",
+)
+@click.option("--verbose", is_flag=True, help="Enable verbose logs.")
+def ollama_hook_command(
+    name: str,
+    title: str | None,
+    channel: str | None,
+    max_response_chars: int,
+    quiet_when_focused: bool,
+    chime: str,
+    verbose: bool,
+) -> None:
+    payload = _read_json_lines_payload(payload_text=sys.stdin.read(), verbose=verbose, source_label="Ollama hook")
+    if payload is None:
+        return
+
+    # Ollama streams JSON lines and marks completion with done=true.
+    done_flag = payload.get("done")
+    if isinstance(done_flag, bool) and not done_flag:
+        return
+
+    model = _extract_payload_text(payload, ("model",), 80)
+    response = _extract_payload_text(payload, ("response",), max_response_chars)
+    done_reason = _extract_payload_text(payload, ("done_reason",), 80)
+
+    body_lines: list[str] = ["Event: done"]
+    if model:
+        body_lines.append(f"Model: {model}")
+    if response:
+        body_lines.append(f"Response: {response}")
+    if done_reason:
+        body_lines.append(f"Reason: {done_reason}")
+
+    _notify_task_hook(
+        name=name,
+        title=title,
+        channel=channel,
+        quiet_when_focused=quiet_when_focused,
+        chime=chime,
+        verbose=verbose,
+        body_lines=body_lines,
+        metadata={
+            "event": "done",
+            "model": payload.get("model"),
+            "done_reason": payload.get("done_reason"),
+            "source": "ollama",
+        },
+    )
+
+
+@app.command("watch", help="Watch an existing process ID until it exits.")
+@click.option("--pid", type=click.IntRange(min=1), required=True, help="PID to monitor until exit.")
+@click.option("--name", type=str, default=None, help="Tool name shown in notification title.")
+@click.option("--title", type=str, default=None, help="Override notification title.")
+@click.option(
+    "--channel",
+    type=click.Choice(CHANNEL_CHOICES, case_sensitive=False),
+    default=None,
+    help="Notification channel: desktop, console, or both.",
+)
+@click.option(
+    "--poll-interval",
+    type=click.FloatRange(min=0.05),
+    default=None,
+    help="Polling interval in seconds.",
+)
+@click.option("--verbose", is_flag=True, help="Enable verbose logs.")
+def watch_command(
+    pid: int,
+    name: str | None,
+    title: str | None,
+    channel: str | None,
+    poll_interval: float | None,
+    verbose: bool,
+) -> None:
+    config = load_config()
+    selected_channel = channel or _default_channel(config)
+    notifier = _resolve_notifier(selected_channel, verbose=verbose)
+    effective_name = name or _infer_tool_name_from_pid(pid)
+
+    watcher = ProcessWatcher(poll_interval=poll_interval or config.poll_interval)
+    result = watcher.wait_for_exit(pid)
+
+    _notify_watch_with_fallback(
+        notifier=notifier,
+        result=result,
+        tool_name=effective_name,
+        title_override=title,
+        default_tool_name=config.title_prefix,
+        verbose=verbose,
+    )
+
+    if result.exit_code is not None:
+        raise SystemExit(result.exit_code)
+    raise SystemExit(0)
+
+
+@app.command("test-notify", help="Send a sample notification.")
+@click.option(
+    "--channel",
+    type=click.Choice(CHANNEL_CHOICES, case_sensitive=False),
+    default=None,
+    help="Notification channel: desktop, console, or both.",
+)
+@click.option("--verbose", is_flag=True, help="Enable verbose logs.")
+def test_notify_command(channel: str | None, verbose: bool) -> None:
+    config = load_config()
+    selected_channel = channel or _default_channel(config)
+    notifier = _resolve_notifier(selected_channel, verbose=verbose)
+
+    title_text = f"[{config.title_prefix}] Test Notification"
+    body_text = "agent-notify is installed and can send notifications."
+
+    try:
+        notifier.notify(title=title_text, message=body_text)
+    except Exception as exc:
+        _warn(f"Desktop notification failed: {exc}. Falling back to console output.")
+        ConsoleNotifier().notify(title=title_text, message=body_text)
+
+
+@app.command("shell-init", help="Print shell hook script for automatic notifications.")
+@click.option(
+    "--shell",
+    "shell_name",
+    type=click.Choice(SHELL_CHOICES, case_sensitive=False),
+    default=None,
+    help="Target shell.",
+)
+@click.option(
+    "--min-seconds",
+    type=click.IntRange(min=1),
+    default=10,
+    show_default=True,
+    help="Notify only for commands lasting at least this many seconds.",
+)
+@click.option("--name", type=str, default="Agent", show_default=True, help="Default tool label.")
+@click.option(
+    "--channel",
+    type=click.Choice(CHANNEL_CHOICES, case_sensitive=False),
+    default=None,
+    help="Notification channel used by shell hook.",
+)
+def shell_init_command(shell_name: str | None, min_seconds: int, name: str, channel: str | None) -> None:
+    config = load_config()
+    selected_channel = channel or _default_channel(config)
+    resolved_shell = (shell_name or _detect_shell()).lower()
+    notifier_bin = _resolve_notifier_bin()
+    python_bin = str(Path(sys.executable))
+    project_root = str(Path(__file__).resolve().parents[1])
+    script = render_shell_init(
+        shell=resolved_shell,
+        min_seconds=min_seconds,
+        name=name,
+        channel=selected_channel,
+        notifier_bin=notifier_bin,
+        python_bin=python_bin,
+        project_root=project_root,
+    )
+    click.echo(script.rstrip())
+
+
+@app.command("tail", help="Watch a log file and notify when a pattern appears.")
+@click.option(
+    "--file",
+    "file_path",
+    type=click.Path(exists=True, dir_okay=False, readable=True, path_type=Path),
+    required=True,
+)
+@click.option("--pattern", type=str, required=True, help="Pattern that triggers notification.")
+@click.option("--name", type=str, default=None, help="Tool name shown in notification title.")
+@click.option("--title", type=str, default=None, help="Override notification title.")
+@click.option(
+    "--channel",
+    type=click.Choice(CHANNEL_CHOICES, case_sensitive=False),
+    default=None,
+    help="Notification channel: desktop, console, or both.",
+)
+@click.option(
+    "--poll-interval",
+    type=click.FloatRange(min=0.05),
+    default=0.5,
+    show_default=True,
+)
+@click.option("--verbose", is_flag=True, help="Enable verbose logs.")
+def tail_command(
+    file_path: Path,
+    pattern: str,
+    name: str | None,
+    title: str | None,
+    channel: str | None,
+    poll_interval: float,
+    verbose: bool,
+) -> None:
+    config = load_config()
+    selected_channel = channel or _default_channel(config)
+    notifier = _resolve_notifier(selected_channel, verbose=verbose)
+
+    started = time.monotonic()
+    with file_path.open("r", encoding="utf-8", errors="replace") as handle:
+        while True:
+            line = handle.readline()
+            if not line:
+                time.sleep(poll_interval)
+                continue
+
+            if pattern in line:
+                duration = time.monotonic() - started
+                title_text = title or f"[{name or config.title_prefix}] Done"
+                body_text = f"Pattern '{pattern}' detected in {duration:.2f}s\nFile: {file_path}"
+                try:
+                    notifier.notify(title=title_text, message=body_text)
+                except Exception as exc:
+                    _warn(f"Desktop notification failed: {exc}. Falling back to console output.")
+                    ConsoleNotifier().notify(title=title_text, message=body_text)
+                return
+
+
+def main() -> None:
+    app(prog_name="agent-notify")
+
+
+if __name__ == "__main__":
+    main()
