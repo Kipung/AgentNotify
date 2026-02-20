@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 import platform
 import shlex
 import shutil
@@ -20,7 +19,6 @@ from agentnotify.core.notifications import build_title, notify_run_completion, n
 from agentnotify.core.procinfo import get_process_name
 from agentnotify.core.result import RunResult, WatchResult
 from agentnotify.core.runner import ProcessRunner
-from agentnotify.core.shellhooks import render_shell_init
 from agentnotify.core.watcher import ProcessWatcher
 from agentnotify.notify.base import CompositeNotifier, NotificationLevel, Notifier, NotifierUnavailable
 from agentnotify.notify.console import ConsoleNotifier
@@ -29,7 +27,6 @@ from agentnotify.notify.windows import WindowsNotifier
 
 CHANNEL_CHOICES = ["desktop", "console", "both"]
 CHIME_CHOICES = ["none", "bell", "ping"]
-SHELL_CHOICES = ["zsh", "bash"]
 TERMINAL_APP_NAMES = {
     "Terminal",
     "iTerm2",
@@ -367,37 +364,6 @@ def _infer_tool_name_from_pid(pid: int) -> str | None:
     if pid > 0:
         return f"pid-{pid}"
     return None
-
-
-def _detect_shell() -> str:
-    shell_path = os.environ.get("SHELL", "")
-    shell_name = Path(shell_path).name.lower()
-    if "bash" in shell_name:
-        return "bash"
-    return "zsh"
-
-
-def _resolve_notifier_bin() -> str:
-    # Prefer the CLI binary currently used in this shell.
-    detected = shutil.which("agent-notify")
-    if detected:
-        return str(Path(detected).resolve())
-
-    executable = Path(sys.executable)
-    candidate = executable.parent / "agent-notify"
-    if candidate.exists():
-        return str(candidate)
-
-    resolved_candidate = executable.resolve().parent / "agent-notify"
-    if resolved_candidate.exists():
-        return str(resolved_candidate)
-
-    argv0 = Path(sys.argv[0])
-    if argv0.exists() and argv0.name.startswith("agent-notify"):
-        return str(argv0.resolve())
-
-    # Fallback used by shell script only when AGENT_NOTIFY_BIN is missing.
-    return "agent-notify"
 
 
 def _notify_run_with_fallback(
@@ -1106,47 +1072,6 @@ def test_notify_command(channel: str | None, verbose: bool) -> None:
     except Exception as exc:
         _warn(f"Desktop notification failed: {exc}. Falling back to console output.")
         ConsoleNotifier().notify(title=title_text, message=body_text)
-
-
-@app.command("shell-init", help="Print shell hook script for automatic notifications.")
-@click.option(
-    "--shell",
-    "shell_name",
-    type=click.Choice(SHELL_CHOICES, case_sensitive=False),
-    default=None,
-    help="Target shell.",
-)
-@click.option(
-    "--min-seconds",
-    type=click.IntRange(min=1),
-    default=10,
-    show_default=True,
-    help="Notify only for commands lasting at least this many seconds.",
-)
-@click.option("--name", type=str, default="Agent", show_default=True, help="Default tool label.")
-@click.option(
-    "--channel",
-    type=click.Choice(CHANNEL_CHOICES, case_sensitive=False),
-    default=None,
-    help="Notification channel used by shell hook.",
-)
-def shell_init_command(shell_name: str | None, min_seconds: int, name: str, channel: str | None) -> None:
-    config = load_config()
-    selected_channel = channel or _default_channel(config)
-    resolved_shell = (shell_name or _detect_shell()).lower()
-    notifier_bin = _resolve_notifier_bin()
-    python_bin = str(Path(sys.executable))
-    project_root = str(Path(__file__).resolve().parents[1])
-    script = render_shell_init(
-        shell=resolved_shell,
-        min_seconds=min_seconds,
-        name=name,
-        channel=selected_channel,
-        notifier_bin=notifier_bin,
-        python_bin=python_bin,
-        project_root=project_root,
-    )
-    click.echo(script.rstrip())
 
 
 @app.command("tail", help="Watch a log file and notify when a pattern appears.")

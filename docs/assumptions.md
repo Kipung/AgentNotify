@@ -9,7 +9,7 @@ Date: 2026-02-20
 5. Linux desktop notifications are intentionally left extensible but not implemented in this release.
 6. CLI implementation uses Click (instead of Typer) to satisfy the Typer-or-Click requirement while keeping dependencies minimal and broadly available.
 7. Tool names are auto-detected when `--name` is not provided: `run` uses the wrapped command and `watch` uses best-effort PID process-name lookup.
-8. Automatic shell integration is provided for `zsh` and `bash` via generated hook scripts (`shell-init`), but this mode is process-exit based and not task-event based.
+8. Process-exit shell integration is intentionally not part of this project direction; the focus is task-level notifications via tool-native hooks.
 9. Team process defaults to Scrum-style cadence for execution tracking: daily standups on weekdays, weekly refinement, and biweekly planning/review-retro.
 10. Standup default start time is assumed to be 09:00 local timezone unless explicitly changed.
 11. Direction changes are captured by updating `docs/project_charter.md`, `docs/assumptions.md`, and `docs/commit_plan.md` together to prevent drift.

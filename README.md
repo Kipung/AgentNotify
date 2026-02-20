@@ -50,17 +50,10 @@ agent-notify run -- python3 -c "import time; time.sleep(8)"
 
 If the command fails, the notification title changes to `Failed`.
 
-## Choose Your Mode
+## Behavior Model
 
-### Mode A: Task-Level Notifications (Recommended for interactive CLIs)
-
-This notifies when an agent turn/task completes inside Codex/Claude/Gemini flows.
-You do not need to exit the CLI session.
-
-### Mode B: Shell Exit Notifications (`shell-init`)
-
-This notifies when shell commands end. For interactive agents, that usually means on CLI exit.
-Use this only if you want process-exit behavior.
+`agent-notify` is task-level first for interactive tools.
+It notifies when hook events fire (Codex/Claude/Gemini integrations), not when you exit your shell.
 
 ## Interactive Tool Setup
 
@@ -177,9 +170,6 @@ ollama run llama3 --format json | agent-notify ollama-hook --name ollama --chann
 `agent-notify tail --file <path> --pattern <text>`
 - Notify when a log pattern appears.
 
-`agent-notify shell-init`
-- Generate shell hook script for process-exit notifications.
-
 Hook bridge commands used by integrations:
 - `agent-notify gemini-hook`
 - `agent-notify claude-hook`
@@ -230,9 +220,8 @@ Environment variables override file values.
 
 ### I only get notifications when I exit the CLI
 
-You are likely using `shell-init` mode. That is process-exit based.
-
-Use task-level hooks (`codex-hook`, `claude-hook`, `gemini-hook`) instead and remove `shell-init` lines from your shell startup file.
+Check your tool hooks configuration. This project intentionally focuses on task-level notifications.
+If notifications only appear on session exit, verify your CLI is calling `codex-hook`, `claude-hook`, or `gemini-hook` on task completion events.
 
 ### Desktop notifications do not appear
 

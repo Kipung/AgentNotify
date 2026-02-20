@@ -28,28 +28,6 @@ def test_emit_command_auto_detects_tool_name() -> None:
     assert "Exit code: 0" in result.output
 
 
-def test_shell_init_command_outputs_script() -> None:
-    runner = CliRunner()
-    result = runner.invoke(
-        app,
-        [
-            "shell-init",
-            "--shell",
-            "zsh",
-            "--min-seconds",
-            "12",
-            "--name",
-            "Agent",
-            "--channel",
-            "both",
-        ],
-    )
-    assert result.exit_code == 0
-    assert "agent-notify shell integration (zsh)" in result.output
-    assert 'AGENT_NOTIFY_MIN_SECONDS="${AGENT_NOTIFY_MIN_SECONDS:-12}"' in result.output
-    assert 'AGENT_NOTIFY_BIN="${AGENT_NOTIFY_BIN:-' in result.output
-
-
 def test_gemini_hook_command_after_agent_notifies_console() -> None:
     runner = CliRunner()
     payload = {

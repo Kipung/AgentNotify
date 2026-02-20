@@ -26,9 +26,9 @@ Primary targets:
 
 As of 2026-02-20, this repository is in **alpha hardening / open-source release-prep stage**:
 
-- Package version: `0.1.0`
+- Package version: `0.1.1`
 - Classifier: `Development Status :: 3 - Alpha`
-- Core features implemented: `run`, `watch`, `test-notify`, `shell-init`, optional `tail`
+- Core features implemented: `run`, `watch`, `test-notify`, optional `tail`
 - CI workflow present for macOS + Windows
 
 ## Scope Boundary
