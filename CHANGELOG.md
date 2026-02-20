@@ -12,6 +12,7 @@ All notable changes to this project will be documented in this file.
 
 - Removed `shell-init` process-exit notification mode from the CLI.
 - Removed shell hook generation internals/tests and aligned project docs to task-level notifications only.
+- Updated Windows PID existence checks to avoid signal-based probing during watch mode.
 
 ## [0.1.1] - 2026-02-20
 

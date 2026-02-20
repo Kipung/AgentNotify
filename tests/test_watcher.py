@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import os
+import platform
 import subprocess
 import sys
+
+import pytest
 
 from agentnotify.core.watcher import ProcessWatcher, pid_exists
 
@@ -35,3 +38,47 @@ def test_watcher_waits_for_running_process() -> None:
     assert result.duration_seconds >= 0.2
     if result.exit_code is not None:
         assert result.exit_code == 0
+
+
+def test_pid_exists_windows_true_without_os_kill(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(platform, "system", lambda: "Windows")
+
+    def fail_kill(pid: int, sig: int) -> None:
+        del pid, sig
+        raise AssertionError("os.kill should not be used on Windows pid checks")
+
+    monkeypatch.setattr(os, "kill", fail_kill)
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(  # noqa: ANN002, ANN003
+            args=args,
+            returncode=0,
+            stdout="",
+            stderr="",
+        ),
+    )
+
+    assert pid_exists(4242) is True
+
+
+def test_pid_exists_windows_false_without_os_kill(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(platform, "system", lambda: "Windows")
+
+    def fail_kill(pid: int, sig: int) -> None:
+        del pid, sig
+        raise AssertionError("os.kill should not be used on Windows pid checks")
+
+    monkeypatch.setattr(os, "kill", fail_kill)
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(  # noqa: ANN002, ANN003
+            args=args,
+            returncode=1,
+            stdout="",
+            stderr="",
+        ),
+    )
+
+    assert pid_exists(4242) is False

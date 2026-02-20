@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import platform
+import subprocess
 import time
 from datetime import datetime, timezone
 
@@ -15,6 +16,9 @@ def pid_exists(pid: int) -> bool:
 
     if pid <= 0:
         return False
+
+    if platform.system() == "Windows":
+        return _pid_exists_windows(pid)
 
     try:
         os.kill(pid, 0)
@@ -28,6 +32,23 @@ def pid_exists(pid: int) -> bool:
             return False
         return False
     return True
+
+
+def _pid_exists_windows(pid: int) -> bool:
+    script = (
+        f"$p=Get-Process -Id {pid} -ErrorAction SilentlyContinue; "
+        "if ($p) { exit 0 } else { exit 1 }"
+    )
+    try:
+        completed = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", script],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except OSError:
+        return False
+    return completed.returncode == 0
 
 
 class ProcessWatcher:
