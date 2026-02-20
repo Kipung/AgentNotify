@@ -4,6 +4,7 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .venv/
+.release-venv/
 .DS_Store
 .mypy_cache/
 .coverage

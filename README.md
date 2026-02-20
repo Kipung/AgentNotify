@@ -1,22 +1,21 @@
 # agent-notify
 
-`agent-notify` is a cross-platform CLI utility that sends a notification when a long-running agentic command completes.
+`agent-notify` sends notifications when long-running CLI/agent tasks finish.
 
-It is designed for Codex CLI/app, Claude Code, Gemini CLI, Antigravity, and any other process-based tooling.
+It supports two usage styles:
 
-## Features
+1. Wrap a command (`agent-notify run -- ...`)
+2. Receive task-level events from interactive agents (Codex, Claude Code, Gemini, Ollama pipelines)
 
-- Wrap and run commands: `agent-notify run -- <cmd...>`
-- Attach to existing processes: `agent-notify watch --pid <pid>`
-- Notifications for success and failure
-- Summary payload includes duration and exit code, with optional output tail lines
-- macOS desktop notifications via Notification Center (`osascript`)
-- Windows desktop notifications via PowerShell + BurntToast, with `win10toast` fallback
-- Console fallback channel for unsupported environments
+## Why People Use This
 
-## Installation
+- You can keep coding in one window and get notified when a background task completes.
+- Notifications include success/failure, duration, and exit code.
+- Works on macOS and Windows (with console fallback when desktop notifications are unavailable).
 
-Preferred:
+## Install
+
+Recommended:
 
 ```bash
 pipx install agent-notify
@@ -34,47 +33,48 @@ From source:
 python -m pip install -e .
 ```
 
-## Quickstart
+Confirm install:
 
-Recommended: task-level hooks for interactive CLIs (no exit required).
-
-### 1) Gemini CLI
-
-Configure Gemini `AfterAgent` hook:
-
-```json
-{
-  "hooksConfig": {
-    "enabled": true
-  },
-  "hooks": {
-    "AfterAgent": [
-      {
-        "matcher": "*",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "agent-notify gemini-hook --name gemini --channel both --quiet-when-focused --chime ping",
-            "timeout": 10000
-          }
-        ]
-      }
-    ]
-  }
-}
+```bash
+agent-notify --help
+agent-notify test-notify --channel console
 ```
 
-### 2) Codex CLI
+## 2-Minute Quickstart
 
-Codex has a built-in `notify` command hook that fires when an agent turn completes.
-Use the provided bridge script:
+Run any long command through the wrapper:
+
+```bash
+agent-notify run -- python3 -c "import time; time.sleep(8)"
+```
+
+If the command fails, the notification title changes to `Failed`.
+
+## Choose Your Mode
+
+### Mode A: Task-Level Notifications (Recommended for interactive CLIs)
+
+This notifies when an agent turn/task completes inside Codex/Claude/Gemini flows.
+You do not need to exit the CLI session.
+
+### Mode B: Shell Exit Notifications (`shell-init`)
+
+This notifies when shell commands end. For interactive agents, that usually means on CLI exit.
+Use this only if you want process-exit behavior.
+
+## Interactive Tool Setup
+
+### Codex CLI
+
+Codex provides a `notify` hook. Use the included bridge:
 
 ```bash
 chmod +x examples/codex_notify_bridge.sh
-realpath examples/codex_notify_bridge.sh
+BRIDGE_PATH="$(realpath examples/codex_notify_bridge.sh)"
+echo "$BRIDGE_PATH"
 ```
 
-Add this to `~/.codex/config.toml`:
+Add to `~/.codex/config.toml`:
 
 ```toml
 notify = [
@@ -82,19 +82,18 @@ notify = [
 ]
 ```
 
-This wrapper handles Codex payload format differences and uses your installed `agent-notify`
-binary when available. Optional debug logging is disabled by default and can be enabled with:
+Optional debug logs:
 
 ```bash
 export AGENT_NOTIFY_DEBUG=1
 ```
 
-Default debug log location:
+Log location:
 `~/.agentnotify/logs/codex_notify.log`
 
-### 3) Claude Code
+### Claude Code
 
-Configure Claude hooks (project-local `.claude/settings.local.json` or user settings):
+Configure hooks in `.claude/settings.local.json` (or user settings):
 
 ```json
 {
@@ -125,152 +124,87 @@ Configure Claude hooks (project-local `.claude/settings.local.json` or user sett
 }
 ```
 
-### 4) Ollama
+### Gemini CLI
 
-- Pure `ollama run` does not expose a native task-finished hook in interactive mode.
-- If using `ollama launch codex` or `ollama launch claude`, configure Codex/Claude hooks above and notifications still work.
-- For non-interactive JSON output, you can pipe into:
-  - `agent-notify ollama-hook --name ollama --channel both`
+Configure `AfterAgent` hook:
 
-Legacy mode (process exit, not task-level):
-
-```bash
-eval "$(agent-notify shell-init --shell zsh --min-seconds 10 --channel both)"
+```json
+{
+  "hooksConfig": {
+    "enabled": true
+  },
+  "hooks": {
+    "AfterAgent": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "agent-notify gemini-hook --name gemini --channel both --quiet-when-focused --chime ping",
+            "timeout": 10000
+          }
+        ]
+      }
+    ]
+  }
+}
 ```
 
-Disable legacy shell-exit notifications:
+### Ollama
 
-```bash
-sed -i '' '/agent-notify shell-init/d' ~/.zshrc
-source ~/.zshrc
-```
-
-If you want only task-level notifications, do not enable `shell-init`.
-
-## CLI Reference
-
-### `agent-notify run -- <cmd...>`
-
-- Wrapper exit code matches wrapped command exit code.
-
-Options:
-
-- `--name <tool>`: notification label
-  - if omitted, `agent-notify` auto-detects from the wrapped command
-- `--title <string>`: title override
-- `--tail-lines <N>`: include last N output lines
-- `--no-capture`: disable stdout/stderr tail capture
-- `--channel desktop|console|both`: channel selection
-- `--verbose`: verbose fallback/warning logs
-
-Examples:
-
-```bash
-agent-notify run --name codex --tail-lines 20 -- codex run "build docs"
-agent-notify run --channel both -- python -c "import time; time.sleep(3)"
-```
-
-### `agent-notify watch --pid <pid>`
-
-Options:
-
-- `--name`, `--title`, `--channel`, `--verbose`
-  - if `--name` is omitted, `agent-notify` tries to detect process name from PID
-- `--poll-interval <seconds>`
+- Pure interactive `ollama run` currently has no native per-turn completion hook.
+- If you use `ollama launch codex` or `ollama launch claude`, configure Codex/Claude hooks above.
+- For non-interactive JSON output (`--format json`), pipe into `agent-notify ollama-hook`.
 
 Example:
 
 ```bash
-python -c "import time; time.sleep(5)" &
-agent-notify watch --pid $! --name background-job
+ollama run llama3 --format json | agent-notify ollama-hook --name ollama --channel both
 ```
 
-### `agent-notify tail --file <path> --pattern <text>`
+## Core Commands
 
-Optional log watcher mode that notifies when a pattern appears.
+`agent-notify run -- <cmd...>`
+- Run and notify on completion.
+- Wrapper exits with the same exit code as the wrapped command.
 
-### `agent-notify test-notify`
+`agent-notify watch --pid <pid>`
+- Watch an existing process ID until exit.
 
-Sends a sample notification through the selected channel.
+`agent-notify test-notify`
+- Send a sample notification.
 
-### `agent-notify emit` (integration/internal)
+`agent-notify tail --file <path> --pattern <text>`
+- Notify when a log pattern appears.
 
-Sends a completion notification from external hooks with explicit command metadata.
+`agent-notify shell-init`
+- Generate shell hook script for process-exit notifications.
 
-### `agent-notify gemini-hook`
+Hook bridge commands used by integrations:
+- `agent-notify gemini-hook`
+- `agent-notify claude-hook`
+- `agent-notify codex-hook`
+- `agent-notify ollama-hook`
 
-Reads a Gemini hook JSON payload from `stdin` and notifies for matching events.
+## Common Customizations
 
-Default behavior:
+Suppress notifications while terminal is focused (macOS):
 
-- Event trigger: `AfterAgent`
-- Tool label: `gemini`
+```bash
+agent-notify gemini-hook --quiet-when-focused
+```
 
-Useful flags:
+Add sound:
 
-- `--event <name>`: trigger on a different hook event
-- `--name <tool>`: notification label
-- `--channel desktop|console|both`
-- `--quiet-when-focused`: suppress notification while terminal is in focus (macOS)
-- `--chime none|bell|ping`: optional sound when notifying
+```bash
+agent-notify claude-hook --chime ping
+```
 
-### `agent-notify claude-hook`
+Force console output:
 
-Reads a Claude hook JSON payload from `stdin` and notifies for matching events.
-
-Default behavior:
-
-- Event trigger: `Stop`
-- Tool label: `claude-code`
-
-Useful flags:
-
-- `--event <name>`: trigger on a different hook event (for example `SubagentStop`)
-- `--name <tool>`: notification label
-- `--channel desktop|console|both`
-- `--quiet-when-focused`: suppress notification while terminal is in focus (macOS)
-- `--chime none|bell|ping`: optional sound when notifying
-
-### `agent-notify codex-hook [payload]`
-
-Reads a Codex `notify` JSON payload (argument or `stdin`) and notifies for matching events.
-
-Default behavior:
-
-- Event trigger: `agent-turn-complete`
-- Tool label: `codex`
-
-Useful flags:
-
-- `--event <name>`: trigger on a different Codex event type
-- `--name <tool>`: notification label
-- `--channel desktop|console|both`
-- `--quiet-when-focused`: suppress notification while terminal is in focus (macOS)
-- `--chime none|bell|ping`: optional sound when notifying
-
-### `agent-notify ollama-hook`
-
-Reads Ollama JSON/JSONL output from `stdin` (use `ollama run --format json`) and notifies on `done=true`.
-
-### `agent-notify shell-init`
-
-Prints a shell hook script for `zsh`/`bash`. This mode notifies on process exit, not on task-level agent events.
-
-## Notification Content
-
-Default title:
-
-- Success: `[<tool>] Done`
-- Failure: `[<tool>] Failed`
-- If no tool is provided, defaults to `[Agent] ...` (configurable).
-
-Body includes:
-
-- Duration (human readable)
-- Exit code (or `unknown` when unavailable)
-- Optional tail output lines
-
-Long bodies are truncated safely.
+```bash
+agent-notify run --channel console -- your-command
+```
 
 ## Configuration
 
@@ -281,9 +215,7 @@ Environment variables:
 - `AGENT_NOTIFY_TAIL_LINES=20`
 - `AGENT_NOTIFY_POLL_INTERVAL=1.0`
 
-Optional TOML file:
-
-`~/.agentnotify/config.toml`
+Optional TOML config at `~/.agentnotify/config.toml`:
 
 ```toml
 title_prefix = "Agent"
@@ -292,57 +224,42 @@ tail_lines = 20
 poll_interval = 1.0
 ```
 
-Environment variables override config file values.
+Environment variables override file values.
+
+## Troubleshooting
+
+### I only get notifications when I exit the CLI
+
+You are likely using `shell-init` mode. That is process-exit based.
+
+Use task-level hooks (`codex-hook`, `claude-hook`, `gemini-hook`) instead and remove `shell-init` lines from your shell startup file.
+
+### Desktop notifications do not appear
+
+1. Test fallback path:
+   - `agent-notify test-notify --channel console`
+2. Verify platform backend:
+   - macOS uses `osascript`
+   - Windows uses PowerShell/BurntToast (with `win10toast` fallback)
+
+### Codex notifications not firing
+
+1. Confirm `notify` is configured in `~/.codex/config.toml`.
+2. Confirm bridge script is executable: `chmod +x examples/codex_notify_bridge.sh`.
+3. Enable bridge debug logs with `AGENT_NOTIFY_DEBUG=1` and inspect `~/.agentnotify/logs/codex_notify.log`.
 
 ## Platform Notes
 
-### macOS
+macOS:
+- Desktop notifications via Notification Center (`osascript`).
 
-Uses:
+Windows:
+- Primary backend: PowerShell + BurntToast.
+- Optional fallback dependency: `pip install "agent-notify[windows]"`.
 
-```bash
-osascript -e 'display notification "..." with title "..."'
-```
+## For Maintainers
 
-If unavailable, `agent-notify` falls back to console output.
-
-### Windows
-
-Primary backend:
-
-- PowerShell + BurntToast (`New-BurntToastNotification`)
-
-Install BurntToast:
-
-```powershell
-Install-Module BurntToast -Scope CurrentUser
-```
-
-Fallback backend:
-
-- Python `win10toast` (optional):
-
-```bash
-pip install "agent-notify[windows]"
-```
-
-## Examples
-
-Demo scripts:
-
-- `examples/slow_success.sh`
-- `examples/slow_fail.sh`
-
-Run:
-
-```bash
-agent-notify run --name demo -- ./examples/slow_success.sh
-agent-notify run --name demo -- ./examples/slow_fail.sh
-```
-
-## Development
-
-Install dev tools and run checks:
+Development checks:
 
 ```bash
 python -m pip install -e ".[dev]"
@@ -352,30 +269,15 @@ python -m build
 twine check dist/*
 ```
 
-## GitHub Release
+Release checklist:
+- `docs/release_checklist.md`
 
-Before first public release:
-
-1. Update repository links in `pyproject.toml` (`[project.urls]`).
-2. Confirm package metadata and version (`agentnotify/__init__.py`, `pyproject.toml`, `CHANGELOG.md`).
-3. Run local checks (`ruff check .` and `pytest -q`).
-4. Follow the release checklist in `docs/release_checklist.md`.
-
-## Project Management
-
-- Project charter: `docs/project_charter.md`
-- Scrum working agreement: `docs/scrum_working_agreement.md`
-- Assumptions log: `docs/assumptions.md`
-- Suggested commit sequencing: `docs/commit_plan.md`
-- Release checklist: `docs/release_checklist.md`
-- Security policy: `SECURITY.md`
-
-## Roadmap
-
-- Linux desktop backend plugin
-- Webhook/Slack channel
-- Cooldown/debounce controls
-- System tray integration
+Project/process docs:
+- `docs/project_charter.md`
+- `docs/scrum_working_agreement.md`
+- `docs/assumptions.md`
+- `docs/commit_plan.md`
+- `SECURITY.md`
 
 ## License
 

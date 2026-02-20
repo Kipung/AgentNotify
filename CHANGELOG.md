@@ -23,6 +23,7 @@ All notable changes to this project will be documented in this file.
 
 - Removed hardcoded absolute paths from README Codex setup examples.
 - Expanded `.gitignore` with build artifacts, coverage files, logs, and temp debug outputs.
+- Reworked README onboarding flow with clearer mode selection, per-tool setup recipes, and troubleshooting guidance.
 
 ## [0.1.0] - 2026-02-20
 
