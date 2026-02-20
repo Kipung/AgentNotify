@@ -5,8 +5,8 @@ from __future__ import annotations
 import subprocess
 import sys
 import time
+from collections.abc import Sequence
 from datetime import datetime, timezone
-from typing import Sequence
 
 from agentnotify.core.output import OutputRingBuffer
 from agentnotify.core.result import RunResult

@@ -15,12 +15,21 @@ from pathlib import Path
 import click
 
 from agentnotify.config.config import AppConfig, load_config
-from agentnotify.core.notifications import build_title, notify_run_completion, notify_watch_completion
+from agentnotify.core.notifications import (
+    build_title,
+    notify_run_completion,
+    notify_watch_completion,
+)
 from agentnotify.core.procinfo import get_process_name
 from agentnotify.core.result import RunResult, WatchResult
 from agentnotify.core.runner import ProcessRunner
 from agentnotify.core.watcher import ProcessWatcher
-from agentnotify.notify.base import CompositeNotifier, NotificationLevel, Notifier, NotifierUnavailable
+from agentnotify.notify.base import (
+    CompositeNotifier,
+    NotificationLevel,
+    Notifier,
+    NotifierUnavailable,
+)
 from agentnotify.notify.console import ConsoleNotifier
 from agentnotify.notify.macos import MacOSNotifier
 from agentnotify.notify.windows import WindowsNotifier
@@ -124,7 +133,10 @@ def _read_json_lines_payload(
 
     if parsed is None:
         if verbose:
-            _warn(f"{source_label} payload did not include JSON object lines. Skipping notification.")
+            _warn(
+                f"{source_label} payload did not include JSON object lines. "
+                "Skipping notification."
+            )
         return None
     return parsed
 
@@ -477,10 +489,10 @@ def run_command(
         )
     except FileNotFoundError as exc:
         click.secho(f"Command not found: {exc.filename}", fg="red", err=True)
-        raise SystemExit(127)
+        raise SystemExit(127) from exc
     except Exception as exc:
         click.secho(f"Failed to run command: {exc}", fg="red", err=True)
-        raise SystemExit(1)
+        raise SystemExit(1) from exc
 
     _notify_run_with_fallback(
         notifier=notifier,
@@ -497,7 +509,13 @@ def run_command(
 @app.command("emit", help="Send a completion notification from external integrations.")
 @click.option("--name", type=str, default=None, help="Tool name shown in notification title.")
 @click.option("--title", type=str, default=None, help="Override notification title.")
-@click.option("--command", "command_text", type=str, required=True, help="Command string to include.")
+@click.option(
+    "--command",
+    "command_text",
+    type=str,
+    required=True,
+    help="Command string to include.",
+)
 @click.option(
     "--duration-seconds",
     type=click.FloatRange(min=0.0),
@@ -670,7 +688,11 @@ def gemini_hook_command(
     chime: str,
     verbose: bool,
 ) -> None:
-    payload = _read_json_payload(payload_text=sys.stdin.read(), verbose=verbose, source_label="Gemini hook")
+    payload = _read_json_payload(
+        payload_text=sys.stdin.read(),
+        verbose=verbose,
+        source_label="Gemini hook",
+    )
     if payload is None:
         return
 
@@ -770,7 +792,11 @@ def claude_hook_command(
     chime: str,
     verbose: bool,
 ) -> None:
-    payload = _read_json_payload(payload_text=sys.stdin.read(), verbose=verbose, source_label="Claude hook")
+    payload = _read_json_payload(
+        payload_text=sys.stdin.read(),
+        verbose=verbose,
+        source_label="Claude hook",
+    )
     if payload is None:
         return
 
@@ -888,7 +914,11 @@ def codex_hook_command(
     if not _payload_event_matches(hook_event, target_event):
         return
 
-    input_preview = _extract_payload_text(payload_obj, ("input-messages", "input_messages"), max_input_chars)
+    input_preview = _extract_payload_text(
+        payload_obj,
+        ("input-messages", "input_messages"),
+        max_input_chars,
+    )
     assistant_preview = _extract_payload_text(
         payload_obj,
         ("last-assistant-message", "last_assistant_message"),
@@ -966,7 +996,11 @@ def ollama_hook_command(
     chime: str,
     verbose: bool,
 ) -> None:
-    payload = _read_json_lines_payload(payload_text=sys.stdin.read(), verbose=verbose, source_label="Ollama hook")
+    payload = _read_json_lines_payload(
+        payload_text=sys.stdin.read(),
+        verbose=verbose,
+        source_label="Ollama hook",
+    )
     if payload is None:
         return
 

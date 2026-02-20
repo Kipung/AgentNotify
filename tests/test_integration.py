@@ -13,12 +13,16 @@ from agentnotify.notify.null import NullNotifier
 def test_integration_success_process_notifies() -> None:
     runner = ProcessRunner()
     notifier = NullNotifier()
+    command = (
+        "import time; print('progress 1', flush=True); "
+        "time.sleep(0.2); print('done', flush=True)"
+    )
 
     result = runner.run(
         [
             sys.executable,
             "-c",
-            "import time; print('progress 1', flush=True); time.sleep(0.2); print('done', flush=True)",
+            command,
         ],
         tool_name="integration",
         capture_output=True,

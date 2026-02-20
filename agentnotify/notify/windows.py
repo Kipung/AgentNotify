@@ -5,9 +5,15 @@ from __future__ import annotations
 import importlib
 import platform
 import subprocess
-from typing import Any, Callable, Mapping
+from collections.abc import Callable, Mapping
+from typing import Any
 
-from agentnotify.notify.base import NotificationError, NotificationLevel, Notifier, NotifierUnavailable
+from agentnotify.notify.base import (
+    NotificationError,
+    NotificationLevel,
+    Notifier,
+    NotifierUnavailable,
+)
 
 RunCallable = Callable[..., subprocess.CompletedProcess[str]]
 
@@ -77,8 +83,9 @@ class WindowsNotifier(Notifier):
         if completed.returncode == 2:
             return False
 
+        error_text = completed.stderr.strip()
         raise NotificationError(
-            f"PowerShell notifier failed with code {completed.returncode}: {completed.stderr.strip()}"
+            f"PowerShell notifier failed with code {completed.returncode}: {error_text}"
         )
 
     @staticmethod

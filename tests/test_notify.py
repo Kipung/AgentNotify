@@ -1,14 +1,19 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
 import subprocess
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import pytest
 
 from agentnotify.core.notifications import notify_run_completion, notify_watch_completion
 from agentnotify.core.result import RunResult, WatchResult
-from agentnotify.notify.base import CompositeNotifier, NotificationLevel, Notifier, NotifierUnavailable
+from agentnotify.notify.base import (
+    CompositeNotifier,
+    NotificationLevel,
+    Notifier,
+    NotifierUnavailable,
+)
 from agentnotify.notify.macos import MacOSNotifier
 from agentnotify.notify.null import NullNotifier
 from agentnotify.notify.windows import WindowsNotifier

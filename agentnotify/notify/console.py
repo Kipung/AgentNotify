@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import sys
-from typing import Any, Mapping, TextIO
+from collections.abc import Mapping
+from typing import Any, TextIO
 
 from agentnotify.notify.base import NotificationLevel, Notifier
 

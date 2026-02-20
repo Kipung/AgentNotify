@@ -4,9 +4,15 @@ from __future__ import annotations
 
 import shutil
 import subprocess
-from typing import Any, Callable, Mapping
+from collections.abc import Callable, Mapping
+from typing import Any
 
-from agentnotify.notify.base import NotificationError, NotificationLevel, Notifier, NotifierUnavailable
+from agentnotify.notify.base import (
+    NotificationError,
+    NotificationLevel,
+    Notifier,
+    NotifierUnavailable,
+)
 
 RunCallable = Callable[..., subprocess.CompletedProcess[str]]
 
